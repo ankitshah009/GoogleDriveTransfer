@@ -150,11 +150,23 @@ class GoogleDriveTransfer:
 
         # Authenticate source account
         print("📁 Setting up source account...")
-        self.source_service = self._get_service("source")
+        try:
+            self.source_service = self._get_service("source")
+            print("   ✅ Source account ready")
+        except Exception as e:
+            print(f"   ❌ Source account setup failed: {e}")
+            self.source_service = None
+            raise
 
         # Authenticate destination account
         print("📁 Setting up destination account...")
-        self.dest_service = self._get_service("destination")
+        try:
+            self.dest_service = self._get_service("destination")
+            print("   ✅ Destination account ready")
+        except Exception as e:
+            print(f"   ❌ Destination account setup failed: {e}")
+            self.dest_service = None
+            raise
 
         print("✅ Authentication successful!")
 
