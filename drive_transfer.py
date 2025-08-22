@@ -193,12 +193,66 @@ class GoogleDriveTransfer:
             return build('drive', 'v3', credentials=creds)
 
     def get_folder_structure(self, folder_id: str, service, base_path: str = "") -> Dict[str, FileInfo]:
-        """Recursively get all files and folders in the specified folder."""
+        """Efficiently get all files and folders in the specified folder using batch processing."""
+        print(f"📁 Scanning folder: {base_path or 'Root'}")
+        print("   🔄 Getting complete file list... (this may take a moment)")
+
+        # First, get all files and folders in a single query
+        all_files = self._get_all_files_in_folder(folder_id, service)
+
+        # Build the folder tree structure
         structure = {}
+        folders_to_process = [folder_id]
+        folder_paths = {folder_id: base_path}
+        total_folders = len([f for f in all_files if f.get('mimeType') == 'application/vnd.google-apps.folder'])
+        processed_folders = 0
+
+        print(f"   🏗️  Building structure for {total_folders} folders...")
+
+        while folders_to_process:
+            current_folder_id = folders_to_process.pop(0)
+            current_path = folder_paths[current_folder_id]
+            processed_folders += 1
+
+            if processed_folders % 10 == 0 or processed_folders == total_folders:
+                print(f"   📊 Progress: {processed_folders}/{total_folders} folders processed")
+
+            # Get all items in current folder
+            folder_items = [item for item in all_files
+                          if current_folder_id in item.get('parents', [])]
+
+            for item in folder_items:
+                file_path = f"{current_path}/{item['name']}" if current_path else item['name']
+                file_info = FileInfo(
+                    id=item['id'],
+                    name=item['name'],
+                    mime_type=item.get('mimeType', ''),
+                    size=int(item.get('size', 0)),
+                    parents=item.get('parents', []),
+                    path=file_path
+                )
+                structure[item['id']] = file_info
+
+                # If it's a folder, add to processing queue
+                if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                    folders_to_process.append(item['id'])
+                    folder_paths[item['id']] = file_path
+
+        print(f"   ✅ Structure built: {len(structure)} total items")
+        return structure
+
+    def _get_all_files_in_folder(self, folder_id: str, service) -> List[dict]:
+        """Get all files and folders in a folder using efficient pagination."""
+        all_files = []
         page_token = None
+        page_count = 0
 
         while True:
             try:
+                page_count += 1
+                if page_count % 10 == 0:
+                    print(f"   📄 Retrieved {len(all_files)} items so far...")
+
                 results = service.files().list(
                     q=f"'{folder_id}' in parents and trashed = false",
                     fields="nextPageToken, files(id, name, mimeType, size, parents)",
@@ -207,41 +261,26 @@ class GoogleDriveTransfer:
                 ).execute()
 
                 items = results.get('files', [])
+                all_files.extend(items)
                 page_token = results.get('nextPageToken')
-
-                for item in items:
-                    file_path = f"{base_path}/{item['name']}" if base_path else item['name']
-                    file_info = FileInfo(
-                        id=item['id'],
-                        name=item['name'],
-                        mime_type=item.get('mimeType', ''),
-                        size=int(item.get('size', 0)),
-                        parents=item.get('parents', []),
-                        path=file_path
-                    )
-                    structure[item['id']] = file_info
-
-                    # Recursively get subfolder contents
-                    if item.get('mimeType') == 'application/vnd.google-apps.folder':
-                        sub_structure = self.get_folder_structure(
-                            item['id'], service, file_path
-                        )
-                        structure.update(sub_structure)
 
                 if not page_token:
                     break
 
-                time.sleep(self.config.rate_limit_delay)
+                # Only add small delay to respect rate limits
+                if page_count > 1:
+                    time.sleep(0.1)
 
             except HttpError as e:
                 if e.resp.status in [403, 429, 500, 502, 503, 504]:
-                    print(f"⚠️  Rate limit hit, waiting {self.config.retry_delay}s...")
-                    time.sleep(self.config.retry_delay)
-                    self.config.retry_delay *= 2  # Exponential backoff
+                    wait_time = min(self.config.retry_delay * (2 ** page_count), 60)
+                    print(f"⚠️  Rate limit hit, waiting {wait_time}s...")
+                    time.sleep(wait_time)
                 else:
                     raise
 
-        return structure
+        print(f"   ✅ Retrieved {len(all_files)} total items")
+        return all_files
 
     def create_folder_structure(self, files: Dict[str, FileInfo]) -> None:
         """Create the folder structure in destination drive."""
@@ -272,6 +311,13 @@ class GoogleDriveTransfer:
                 if parent_folder and parent_folder.id in self.folder_mapping:
                     parent_id = self.folder_mapping[parent_folder.id]
 
+            # Check if folder already exists in destination
+            existing_folder_id = self._check_folder_exists(folder.name, parent_id)
+            if existing_folder_id:
+                print(f"📁 Folder already exists: {folder.path} (ID: {existing_folder_id})")
+                self.folder_mapping[folder.id] = existing_folder_id
+                continue
+
             # Create folder in destination
             folder_metadata = {
                 'name': folder.name,
@@ -292,6 +338,24 @@ class GoogleDriveTransfer:
                 continue
 
             time.sleep(self.config.rate_limit_delay)
+
+    def _check_folder_exists(self, folder_name: str, parent_id: str) -> Optional[str]:
+        """Check if a folder with the given name already exists in the parent folder."""
+        try:
+            results = self.dest_service.files().list(
+                q=f"name = '{folder_name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+                fields="files(id, name)",
+                pageSize=1
+            ).execute()
+
+            files = results.get('files', [])
+            if files:
+                return files[0]['id']
+            return None
+
+        except HttpError as e:
+            print(f"⚠️  Warning: Could not check if folder exists: {e}")
+            return None
 
     def transfer_file(self, file_info: FileInfo) -> bool:
         """Transfer a single file with retry logic."""
