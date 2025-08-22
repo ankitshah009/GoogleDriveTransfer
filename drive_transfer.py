@@ -390,22 +390,31 @@ class GoogleDriveTransfer:
             print(f"⚠️  Warning: Could not check if folder exists: {e}")
             return None
 
-    def transfer_file(self, file_info: FileInfo) -> bool:
-        """Transfer a single file with retry logic."""
+    def transfer_file_safe(self, file_info: FileInfo, source_folders: Dict[str, FileInfo]) -> bool:
+        """Transfer a single file with retry logic and memory safety."""
         # Show when transfer starts (without newline to avoid interfering with progress)
         print(f"⏳ Starting: {file_info.name}", end='\r')
+
+        # Local variables to avoid memory issues with instance variables
+        local_file_info = FileInfo(
+            id=file_info.id,
+            name=file_info.name,
+            mime_type=file_info.mime_type,
+            size=file_info.size,
+            parents=file_info.parents[:],  # Copy to avoid reference issues
+            path=file_info.path
+        )
 
         for attempt in range(self.config.max_retries):
             try:
                 # Determine destination parent folder
-                parent_path = '/'.join(file_info.path.split('/')[:-1])
+                parent_path = '/'.join(local_file_info.path.split('/')[:-1])
                 parent_id = self.config.dest_folder_id
 
                 if parent_path:
-                    # Find the corresponding folder in destination
-                    source_folders = {fid: f for fid, f in self.get_folder_structure(
-                        self.config.source_folder_id, self.source_service
-                    ).items() if f.mime_type == 'application/vnd.google-apps.folder'}
+                    # Find the corresponding folder in destination (use pre-scanned folders)
+                    source_folders_filtered = {fid: f for fid, f in source_folders.items()
+                                             if f.mime_type == 'application/vnd.google-apps.folder'}
 
                     parent_folder = next(
                         (f for f in source_folders.values() if f.path == parent_path), None
@@ -414,32 +423,32 @@ class GoogleDriveTransfer:
                         parent_id = self.folder_mapping[parent_folder.id]
 
                 # For Google Docs, export as Microsoft Office format
-                if file_info.mime_type.startswith('application/vnd.google-apps'):
-                    return self._transfer_google_doc(file_info, parent_id)
+                if local_file_info.mime_type.startswith('application/vnd.google-apps'):
+                    return self._transfer_google_doc(local_file_info, parent_id)
 
                 # For regular files, download and upload
-                return self._transfer_regular_file(file_info, parent_id)
+                return self._transfer_regular_file(local_file_info, parent_id)
 
             except HttpError as e:
                 if e.resp.status in [403, 429, 500, 502, 503, 504]:
                     if attempt < self.config.max_retries - 1:
                         wait_time = self.config.retry_delay * (2 ** attempt)
-                        print(f"⚠️  Rate limit hit, retrying in {wait_time}s... ({file_info.name})")
+                        print(f"⚠️  Rate limit hit, retrying in {wait_time}s... ({local_file_info.name})")
                         time.sleep(wait_time)
                         continue
                     else:
-                        print(f"❌ Failed to transfer {file_info.name}: {e}")
+                        print(f"❌ Failed to transfer {local_file_info.name}: {e}")
                         return False
                 else:
-                    print(f"❌ Error transferring {file_info.name}: {e}")
+                    print(f"❌ Error transferring {local_file_info.name}: {e}")
                     return False
             except Exception as e:
                 # Check if it's a network error that should be retried
                 if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                    self.handle_network_error(e, "transfer", file_info.name, attempt)
+                    self.handle_network_error(e, "transfer", local_file_info.name, attempt)
                     continue
                 else:
-                    print(f"❌ Unexpected error transferring {file_info.name}: {e}")
+                    print(f"❌ Unexpected error transferring {local_file_info.name}: {e}")
                     return False
 
         return False
@@ -654,32 +663,57 @@ class GoogleDriveTransfer:
         file_list = [f for f in files.values()
                     if f.mime_type != 'application/vnd.google-apps.folder']
 
+        # Pre-scan folder structure once for all files
+        source_folders = {fid: f for fid, f in files.items()
+                         if f.mime_type == 'application/vnd.google-apps.folder'}
+
         self.total_files = len(file_list)
         self.total_bytes = sum(f.size for f in file_list if f.size)
 
         self.start_time = time.time()
         print(f"🚀 Starting transfer of {self.total_files} files ({self.total_bytes / (1024**3):.2f} GB)")
+        print(f"   📁 Using {self.config.max_workers} parallel workers")
         print("=" * 80)
         print("⏳ Beginning file transfers... (progress will be shown for each completed file)")
         print("=" * 80)
 
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            # Submit all file transfer tasks
-            future_to_file = {
-                executor.submit(self.transfer_file, file_info): file_info
-                for file_info in file_list
-            }
+        # Use ThreadPoolExecutor for parallel processing with memory safety
+        print(f"🛡️  Using memory-safe parallel processing with {min(self.config.max_workers, 4)} workers")
 
-            # Process completed transfers
-            for future in as_completed(future_to_file):
-                file_info = future_to_file[future]
-                try:
-                    success = future.result()
-                    if success:
-                        self.update_progress(increment_files=1, increment_bytes=file_info.size, filename=file_info.name)
-                except Exception as e:
-                    print(f"❌ Error in transfer task for {file_info.name}: {e}")
+        # Limit workers to prevent memory issues (max 4 for stability)
+        safe_workers = min(self.config.max_workers, 4)
+
+        with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+            # Process files in small batches to prevent memory buildup
+            batch_size = safe_workers * 2
+            for i in range(0, len(file_list), batch_size):
+                batch = file_list[i:i + batch_size]
+                print(f"📦 Processing batch {i//batch_size + 1}/{(len(file_list) + batch_size - 1)//batch_size} ({len(batch)} files)")
+
+                # Submit batch of file transfer tasks
+                future_to_file = {
+                    executor.submit(self.transfer_file_safe, file_info, source_folders): file_info
+                    for file_info in batch
+                }
+
+                # Process completed transfers in this batch
+                for future in as_completed(future_to_file):
+                    file_info = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            self.update_progress(increment_files=1, increment_bytes=file_info.size, filename=file_info.name)
+                    except Exception as e:
+                        print(f"❌ Error in transfer task for {file_info.name}: {e}")
+
+                # Clean up and force garbage collection after each batch
+                del future_to_file
+                import gc
+                gc.collect()
+
+                # Small pause between batches to let system recover
+                if i + batch_size < len(file_list):
+                    time.sleep(0.5)
 
         end_time = time.time()
         duration = end_time - (self.start_time or end_time)
