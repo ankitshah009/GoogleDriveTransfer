@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from queue import Queue
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -46,6 +46,7 @@ class TransferConfig:
     progress_interval: int = 10
     network_timeout: int = 300  # 5 minutes timeout for network operations
     enable_resumable: bool = True  # Enable resumable uploads
+    disable_ssl_verify: bool = False  # Disable SSL certificate verification (use with caution)
 
 @dataclass
 class FileInfo:
@@ -94,12 +95,45 @@ class GoogleDriveTransfer:
 
         return any(net_error in error_str for net_error in network_errors)
 
-    def handle_network_error(self, error, operation, filename):
-        """Handle network errors with appropriate retry logic."""
+    def handle_network_error(self, error, operation, filename, attempt=0):
+        """Handle network errors with intelligent retry logic."""
         if self.is_network_error(error):
-            wait_time = min(self.config.retry_delay * (2 ** 2), 30)  # Max 30 seconds
-            print(f"🌐 Network error during {operation} of {filename}: {error}")
+            error_str = str(error)
+
+            # Different strategies for different error types
+            if 'SSL:' in error_str or 'decryption failed' in error_str or 'bad record mac' in error_str:
+                # SSL errors need longer delays and different approach
+                base_delay = 10  # Start with 10 seconds for SSL issues
+                max_delay = 120  # Max 2 minutes for SSL issues
+                strategy = "SSL Connection Reset"
+            elif 'IncompleteRead' in error_str:
+                # Connection interruption - shorter delays
+                base_delay = 5
+                max_delay = 60
+                strategy = "Connection Recovery"
+            elif 'TimeoutError' in error_str:
+                # Timeout issues - moderate delays
+                base_delay = 7
+                max_delay = 90
+                strategy = "Timeout Recovery"
+            else:
+                # Other network errors
+                base_delay = 3
+                max_delay = 45
+                strategy = "Network Recovery"
+
+            # Exponential backoff with jitter
+            wait_time = min(base_delay * (2 ** attempt) + (attempt * 2), max_delay)
+
+            print(f"🌐 {strategy} - {operation} of {filename}")
+            print(f"   Error: {error}")
+            print(f"   Attempt: {attempt + 1}")
             print(f"⏳ Waiting {wait_time}s before retry...")
+
+            # Add connection diagnostics for SSL errors
+            if 'SSL:' in error_str:
+                print("   💡 SSL Tip: Try switching to wired connection or checking VPN settings")
+
             time.sleep(wait_time)
             return True  # Should retry
         return False  # Don't retry
@@ -297,7 +331,7 @@ class GoogleDriveTransfer:
             except Exception as e:
                 # Check if it's a network error that should be retried
                 if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                    self.handle_network_error(e, "transfer", file_info.name)
+                    self.handle_network_error(e, "transfer", file_info.name, attempt)
                     continue
                 else:
                     print(f"❌ Unexpected error transferring {file_info.name}: {e}")
@@ -350,7 +384,7 @@ class GoogleDriveTransfer:
 
                     except Exception as e:
                         if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "export download", file_info.name)
+                            self.handle_network_error(e, "export download", file_info.name, attempt)
                             break  # Retry the whole operation
                         else:
                             raise e
@@ -361,7 +395,7 @@ class GoogleDriveTransfer:
                 file_content.seek(0)
 
                 # Upload with timeout
-                media = MediaFileUpload(
+                media = MediaIoBaseUpload(
                     file_content,
                     mimetype=export_mime,
                     chunksize=self.config.chunk_size,
@@ -380,14 +414,14 @@ class GoogleDriveTransfer:
 
                 except Exception as e:
                     if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                        self.handle_network_error(e, "export upload", file_info.name)
+                        self.handle_network_error(e, "export upload", file_info.name, attempt)
                         continue
                     else:
                         raise e
 
             except Exception as e:
                 if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                    self.handle_network_error(e, "Google Doc transfer", file_info.name)
+                    self.handle_network_error(e, "Google Doc transfer", file_info.name, attempt)
                     continue
                 else:
                     print(f"❌ Error transferring Google Doc {file_info.name}: {e}")
@@ -428,7 +462,7 @@ class GoogleDriveTransfer:
 
                     except Exception as e:
                         if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "download", file_info.name)
+                            self.handle_network_error(e, "download", file_info.name, attempt)
                             break  # Retry the whole operation
                         else:
                             raise e
@@ -439,7 +473,7 @@ class GoogleDriveTransfer:
                 file_content.seek(0)
 
                 # Upload to destination with timeout
-                media = MediaFileUpload(
+                media = MediaIoBaseUpload(
                     file_content,
                     mimetype=file_info.mime_type,
                     chunksize=self.config.chunk_size,
@@ -468,7 +502,7 @@ class GoogleDriveTransfer:
 
                     except Exception as e:
                         if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "upload", file_info.name)
+                            self.handle_network_error(e, "upload", file_info.name, attempt)
                             break  # Retry the whole operation
                         else:
                             raise e
@@ -481,7 +515,7 @@ class GoogleDriveTransfer:
 
             except Exception as e:
                 if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                    self.handle_network_error(e, "transfer", file_info.name)
+                    self.handle_network_error(e, "transfer", file_info.name, attempt)
                     continue
                 else:
                     print(f"❌ Error transferring file {file_info.name}: {e}")
@@ -579,6 +613,7 @@ def main():
     parser.add_argument('--timeout', type=int, default=300, help='Network timeout in seconds (default: 300)')
     parser.add_argument('--chunk-size', type=int, default=8*1024*1024, help='Chunk size in bytes (default: 8MB)')
     parser.add_argument('--disable-resumable', action='store_true', help='Disable resumable uploads')
+    parser.add_argument('--disable-ssl-verify', action='store_true', help='Disable SSL certificate verification (use with caution)')
     parser.add_argument('--config', action='store_true', help='Setup configuration')
 
     args = parser.parse_args()
@@ -591,6 +626,7 @@ def main():
     config.network_timeout = args.timeout
     config.chunk_size = args.chunk_size
     config.enable_resumable = not args.disable_resumable
+    config.disable_ssl_verify = args.disable_ssl_verify
 
     if args.config:
         save_config(config)
