@@ -133,26 +133,12 @@ class GoogleDriveTransfer:
                 strategy = "Network Recovery"
                 print("   🌐 Network Error: General connectivity issue")
 
-            # Exponential backoff with jitter
-            wait_time = min(base_delay * (2 ** attempt) + (attempt * 3), max_delay)
+            # Simple exponential backoff
+            wait_time = min(base_delay * (2 ** attempt), max_delay)
 
             print(f"🌐 {strategy} - {operation} of {filename}")
-            print(f"   Error: {error}")
-            print(f"   Attempt: {attempt + 1}/5")
+            print(f"   Attempt: {attempt + 1}/3")
             print(f"⏳ Waiting {wait_time}s before retry...")
-
-            # Add specific troubleshooting tips
-            if 'ssl:' in error_str or 'cipher' in error_str:
-                print("   💡 SSL Tips:")
-                print("      • Try switching from WiFi to wired connection")
-                print("      • Disable VPN/proxy if active")
-                print("      • Check firewall settings")
-                print("      • Try a different network")
-            elif 'timeout' in error_str:
-                print("   💡 Timeout Tips:")
-                print("      • Check internet speed and stability")
-                print("      • Try during off-peak hours")
-                print("      • Large files may take longer")
 
             time.sleep(wait_time)
             return True  # Should retry
@@ -202,17 +188,12 @@ class GoogleDriveTransfer:
             with open(token_file, 'wb') as token:
                 pickle.dump(creds, token)
 
-        # Build service with SSL verification options
-        try:
-            if self.config.disable_ssl_verify:
-                print(f"⚠️  SSL certificate verification disabled for {account_type} account")
-                print("   Note: SSL verification control may not be available for all operations")
-                # Use the standard approach - SSL verification is handled by the underlying libraries
-                # This warning is mainly for user awareness
-            return build('drive', 'v3', credentials=creds)
-        except Exception as e:
-            print(f"❌ Error creating service for {account_type}: {e}")
-            raise
+            # Build service with basic configuration
+            try:
+                return build('drive', 'v3', credentials=creds)
+            except Exception as e:
+                print(f"❌ Error creating service for {account_type}: {e}")
+                raise
 
     def get_folder_structure(self, folder_id: str, service, base_path: str = "") -> Dict[str, FileInfo]:
         """Efficiently get all files and folders in the specified folder using batch processing."""
