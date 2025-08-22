@@ -263,6 +263,9 @@ class GoogleDriveTransfer:
                     pageSize=1000
                 ).execute()
 
+                if results is None:
+                    raise Exception("Google API returned None response")
+
                 items = results.get('files', [])
                 all_files.extend(items)
                 page_token = results.get('nextPageToken')
@@ -333,6 +336,9 @@ class GoogleDriveTransfer:
                     body=folder_metadata, fields='id'
                 ).execute()
 
+                if created_folder is None:
+                    raise Exception("Folder creation returned None response")
+
                 self.folder_mapping[folder.id] = created_folder['id']
                 print(f"📁 Created folder: {folder.path}")
 
@@ -350,6 +356,10 @@ class GoogleDriveTransfer:
                 fields="files(id, name)",
                 pageSize=1
             ).execute()
+
+            if results is None:
+                print("⚠️  Warning: Folder existence check returned None")
+                return None
 
             files = results.get('files', [])
             if files:
@@ -483,6 +493,9 @@ class GoogleDriveTransfer:
                     uploaded_file = self.dest_service.files().create(
                         body=file_metadata, media_body=media, fields='id, name'
                     ).execute()
+
+                    if uploaded_file is None:
+                        raise Exception("File upload returned None response")
 
                     print(f"📄 Transferred Google Doc: {file_info.name}")
                     return True
