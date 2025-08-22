@@ -200,6 +200,14 @@ class GoogleDriveTransfer:
         print(f"📁 Scanning folder: {base_path or 'Root'}")
         print("   🔄 Getting complete file list... (this may take a moment)")
 
+        # Validate service is not None
+        if service is None:
+            raise Exception("Google Drive service is None - authentication may have failed")
+
+        # Validate folder_id is not None or empty
+        if not folder_id or folder_id == 'None' or folder_id.strip() == '':
+            raise Exception(f"Invalid folder ID: '{folder_id}' - folder ID cannot be empty")
+
         # First, get all files and folders in a single query
         all_files = self._get_all_files_in_folder(folder_id, service)
 
@@ -904,6 +912,12 @@ def main():
     try:
         # Authenticate
         transfer.authenticate()
+
+        # Validate services are initialized
+        if transfer.source_service is None:
+            raise Exception("Source service failed to initialize")
+        if transfer.dest_service is None:
+            raise Exception("Destination service failed to initialize")
 
         # Get source folder structure
         print("📋 Scanning source folder structure...")
