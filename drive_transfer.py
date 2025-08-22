@@ -70,6 +70,7 @@ class GoogleDriveTransfer:
         self.total_files = 0
         self.transferred_bytes = 0
         self.total_bytes = 0
+        self.start_time = None
 
     def is_network_error(self, error):
         """Check if error is a network-related issue that should be retried."""
@@ -252,6 +253,9 @@ class GoogleDriveTransfer:
 
     def transfer_file(self, file_info: FileInfo) -> bool:
         """Transfer a single file with retry logic."""
+        # Show when transfer starts (without newline to avoid interfering with progress)
+        print(f"⏳ Starting: {file_info.name}", end='\r')
+
         for attempt in range(self.config.max_retries):
             try:
                 # Determine destination parent folder
@@ -414,7 +418,9 @@ class GoogleDriveTransfer:
                         status, done = downloader.next_chunk()
                         if status:
                             progress = int(status.progress() * 100)
-                            print(f"⬇️  Downloading {file_info.name}: {progress}%", end='\r')
+                            size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
+                            downloaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
+                            print(f"⬇️  {file_info.name}: {progress}% ({downloaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
 
                         # Check for download timeout
                         if time.time() - download_start_time > self.config.network_timeout:
@@ -452,7 +458,9 @@ class GoogleDriveTransfer:
                         status, response = uploader.next_chunk()
                         if status:
                             progress = int(status.progress() * 100)
-                            print(f"⬆️  Uploading {file_info.name}: {progress}%", end='\r')
+                            size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
+                            uploaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
+                            print(f"⬆️  {file_info.name}: {progress}% ({uploaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
 
                         # Check for upload timeout
                         if time.time() - upload_start_time > self.config.network_timeout:
@@ -481,15 +489,22 @@ class GoogleDriveTransfer:
 
         return False
 
-    def update_progress(self, increment_files: int = 1, increment_bytes: int = 0):
+    def update_progress(self, increment_files: int = 1, increment_bytes: int = 0, filename: str = ""):
         """Update transfer progress."""
         with self.progress_lock:
             self.transferred_files += increment_files
             self.transferred_bytes += increment_bytes
 
-            if self.transferred_files % self.config.progress_interval == 0:
-                progress = (self.transferred_files / self.total_files * 100) if self.total_files > 0 else 0
-                print(f"📊 Progress: {self.transferred_files}/{self.total_files} files ({progress:.1f}%)")
+            # Always show progress for each file completion
+            if self.total_files > 0:
+                progress = (self.transferred_files / self.total_files * 100)
+                bytes_progress = (self.transferred_bytes / self.total_bytes * 100) if self.total_bytes > 0 else 0
+
+                # Show detailed progress
+                print(f"✅ {filename}")
+                print(f"📊 Overall: {self.transferred_files}/{self.total_files} files ({progress:.1f}%) | "
+                      f"{self.transferred_bytes / (1024**3):.2f}/{self.total_bytes / (1024**3):.2f} GB ({bytes_progress:.1f}%)")
+                print("-" * 80)
 
     def transfer_all_files(self, files: Dict[str, FileInfo]):
         """Transfer all files using parallel processing."""
@@ -500,7 +515,11 @@ class GoogleDriveTransfer:
         self.total_files = len(file_list)
         self.total_bytes = sum(f.size for f in file_list if f.size)
 
+        self.start_time = time.time()
         print(f"🚀 Starting transfer of {self.total_files} files ({self.total_bytes / (1024**3):.2f} GB)")
+        print("=" * 80)
+        print("⏳ Beginning file transfers... (progress will be shown for each completed file)")
+        print("=" * 80)
 
         # Use ThreadPoolExecutor for parallel processing
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
@@ -516,11 +535,24 @@ class GoogleDriveTransfer:
                 try:
                     success = future.result()
                     if success:
-                        self.update_progress(increment_files=1, increment_bytes=file_info.size)
+                        self.update_progress(increment_files=1, increment_bytes=file_info.size, filename=file_info.name)
                 except Exception as e:
                     print(f"❌ Error in transfer task for {file_info.name}: {e}")
 
-        print("🎉 Transfer completed!")
+        end_time = time.time()
+        duration = end_time - (self.start_time or end_time)
+
+        print("\n🎉 Transfer completed!")
+        print("=" * 80)
+        print("📈 Final Statistics:")
+        print(f"   • Files transferred: {self.transferred_files}/{self.total_files}")
+        print(f"   • Data transferred: {self.transferred_bytes / (1024**3):.2f} GB")
+        print(f"   • Success rate: {(self.transferred_files / self.total_files * 100):.1f}%" if self.total_files > 0 else "N/A")
+        print(f"   • Total time: {duration:.1f} seconds ({duration/60:.1f} minutes)")
+        if self.transferred_bytes > 0:
+            avg_speed = (self.transferred_bytes / duration) / (1024 * 1024)  # MB/s
+            print(f"   • Average speed: {avg_speed:.2f} MB/s")
+        print("=" * 80)
 
 def load_config() -> TransferConfig:
     """Load configuration from file or create default."""
@@ -574,16 +606,20 @@ def main():
 
         # Get source folder structure
         print("📋 Scanning source folder structure...")
+        print("⏳ This may take a moment for large folders...")
         source_files = transfer.get_folder_structure(
             config.source_folder_id, transfer.source_service
         )
+        print(f"✅ Found {len(source_files)} items (files + folders)")
 
         if not source_files:
             print("❌ No files found in source folder!")
             return
 
         # Create destination folder structure
+        print("\n🏗️ Creating destination folder structure...")
         transfer.create_folder_structure(source_files)
+        print("✅ Folder structure created")
 
         # Transfer all files
         transfer.transfer_all_files(source_files)
