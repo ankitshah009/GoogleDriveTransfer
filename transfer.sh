@@ -22,5 +22,5 @@ if [ ! -f "drive_transfer.py" ]; then
     exit 1
 fi
 
-# Run the transfer tool
-python3 drive_transfer.py "$@"
+# Run the transfer tool with transfer subcommand
+python3 drive_transfer.py transfer "$@"
