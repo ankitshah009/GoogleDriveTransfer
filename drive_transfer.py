@@ -696,6 +696,57 @@ class GoogleDriveTransfer:
             print(f"   • Average speed: {avg_speed:.2f} MB/s")
         print("=" * 80)
 
+def run_authentication_test():
+    """Test Google Drive authentication and service creation."""
+    print("=" * 70)
+    print("🔐 GOOGLE DRIVE AUTHENTICATION TEST")
+    print("=" * 70)
+
+    try:
+        from drive_transfer import GoogleDriveTransfer, TransferConfig
+        print("✅ Module import successful")
+    except Exception as e:
+        print(f"❌ Module import failed: {e}")
+        return
+
+    try:
+        config = TransferConfig(
+            source_folder_id='test',
+            dest_folder_id='test'
+        )
+        print("✅ Config creation successful")
+    except Exception as e:
+        print(f"❌ Config creation failed: {e}")
+        return
+
+    try:
+        transfer = GoogleDriveTransfer(config)
+        print("✅ Transfer instance creation successful")
+    except Exception as e:
+        print(f"❌ Transfer instance creation failed: {e}")
+        return
+
+    print("\n🔐 Testing Source Service Authentication...")
+    try:
+        source_service = transfer._get_service("source")
+        print("✅ Source service authentication successful")
+    except Exception as e:
+        print(f"❌ Source service authentication failed: {e}")
+        return
+
+    print("\n🔐 Testing Destination Service Authentication...")
+    try:
+        dest_service = transfer._get_service("destination")
+        print("✅ Destination service authentication successful")
+    except Exception as e:
+        print(f"❌ Destination service authentication failed: {e}")
+        return
+
+    print("\n" + "=" * 70)
+    print("🎉 AUTHENTICATION TEST PASSED!")
+    print("Your Google Drive credentials are working correctly.")
+    print("=" * 70)
+
 def run_network_diagnostics():
     """Run comprehensive network diagnostic tests for Google Drive connectivity."""
     print("=" * 70)
@@ -887,6 +938,9 @@ def main():
     # Network test command (standalone)
     network_parser = subparsers.add_parser('network-test', help='Run network diagnostic tests')
 
+    # Authentication test command (standalone)
+    auth_parser = subparsers.add_parser('auth-test', help='Test Google Drive authentication')
+
     # Config command (standalone)
     config_parser = subparsers.add_parser('config', help='Setup configuration')
 
@@ -896,6 +950,11 @@ def main():
     if args.command == 'network-test':
         print("🔍 Running network diagnostics...")
         run_network_diagnostics()
+        return
+
+    elif args.command == 'auth-test':
+        print("🔐 Running authentication test...")
+        run_authentication_test()
         return
 
     elif args.command == 'config':
