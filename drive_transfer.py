@@ -200,12 +200,12 @@ class GoogleDriveTransfer:
             with open(token_file, 'wb') as token:
                 pickle.dump(creds, token)
 
-            # Build service with basic configuration
-            try:
-                return build('drive', 'v3', credentials=creds)
-            except Exception as e:
-                print(f"❌ Error creating service for {account_type}: {e}")
-                raise
+        # Build service with basic configuration (always executed)
+        try:
+            return build('drive', 'v3', credentials=creds)
+        except Exception as e:
+            print(f"❌ Error creating service for {account_type}: {e}")
+            raise
 
     def get_folder_structure(self, folder_id: str, service, base_path: str = "") -> Dict[str, FileInfo]:
         """Efficiently get all files and folders in the specified folder using batch processing."""
