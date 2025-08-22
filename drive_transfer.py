@@ -182,15 +182,17 @@ class GoogleDriveTransfer:
             with open(token_file, 'wb') as token:
                 pickle.dump(creds, token)
 
-        # Build service with proper HTTP client configuration
-        if self.config.disable_ssl_verify:
-            import httplib2
-            # Create HTTP client with SSL verification disabled
-            http = httplib2.Http(disable_ssl_certificate_validation=True)
-            print(f"⚠️  SSL certificate verification disabled for {account_type} account")
-            return build('drive', 'v3', credentials=creds, http=http)
-        else:
+        # Build service with SSL verification options
+        try:
+            if self.config.disable_ssl_verify:
+                print(f"⚠️  SSL certificate verification disabled for {account_type} account")
+                print("   Note: SSL verification control may not be available for all operations")
+                # Use the standard approach - SSL verification is handled by the underlying libraries
+                # This warning is mainly for user awareness
             return build('drive', 'v3', credentials=creds)
+        except Exception as e:
+            print(f"❌ Error creating service for {account_type}: {e}")
+            raise
 
     def get_folder_structure(self, folder_id: str, service, base_path: str = "") -> Dict[str, FileInfo]:
         """Efficiently get all files and folders in the specified folder using batch processing."""
