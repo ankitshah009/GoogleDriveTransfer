@@ -75,22 +75,28 @@ class GoogleDriveTransfer:
 
     def is_network_error(self, error):
         """Check if error is a network-related issue that should be retried."""
-        error_str = str(error)
+        error_str = str(error).lower()
 
         # Network/SSL errors that should trigger retry
         network_errors = [
-            'IncompleteRead',
-            'SSL:',
+            'incompleteread',
+            'ssl:',
             'decryption failed',
             'bad record mac',
-            'ConnectionResetError',
-            'ConnectionAbortedError',
-            'TimeoutError',
-            'ssl.SSLError',
+            'cipher operation failed',
+            'connectionreseterror',
+            'connectionabortederror',
+            'timeouterror',
+            'ssl.ssleerror',
             'urllib3.exceptions',
-            'requests.exceptions.ConnectionError',
-            'requests.exceptions.Timeout',
-            'requests.exceptions.SSLError'
+            'requests.exceptions.connectionerror',
+            'requests.exceptions.timeout',
+            'requests.exceptions.sslerror',
+            'connection error',
+            'network is unreachable',
+            'temporary failure in name resolution',
+            'connection timed out',
+            'connection refused'
         ]
 
         return any(net_error in error_str for net_error in network_errors)
@@ -98,41 +104,55 @@ class GoogleDriveTransfer:
     def handle_network_error(self, error, operation, filename, attempt=0):
         """Handle network errors with intelligent retry logic."""
         if self.is_network_error(error):
-            error_str = str(error)
+            error_str = str(error).lower()
 
             # Different strategies for different error types
-            if 'SSL:' in error_str or 'decryption failed' in error_str or 'bad record mac' in error_str:
-                # SSL errors need longer delays and different approach
-                base_delay = 10  # Start with 10 seconds for SSL issues
-                max_delay = 120  # Max 2 minutes for SSL issues
-                strategy = "SSL Connection Reset"
-            elif 'IncompleteRead' in error_str:
-                # Connection interruption - shorter delays
-                base_delay = 5
-                max_delay = 60
-                strategy = "Connection Recovery"
-            elif 'TimeoutError' in error_str:
-                # Timeout issues - moderate delays
-                base_delay = 7
-                max_delay = 90
+            if ('ssl:' in error_str or 'decryption failed' in error_str or
+                'bad record mac' in error_str or 'cipher operation failed' in error_str):
+                # SSL/TLS handshake failures - need longer delays
+                base_delay = 15  # Start with 15 seconds for SSL issues
+                max_delay = 300  # Max 5 minutes for SSL issues
+                strategy = "SSL/TLS Handshake Recovery"
+                print("   🔒 SSL Error: This may be caused by network interference or VPN issues")
+            elif 'incompleteread' in error_str or 'connectionreseterror' in error_str:
+                # Connection interruption - moderate delays
+                base_delay = 8
+                max_delay = 120
+                strategy = "Connection Reset Recovery"
+                print("   📡 Connection Error: Check your internet connection stability")
+            elif 'timeouterror' in error_str or 'connection timed out' in error_str:
+                # Timeout issues - longer delays
+                base_delay = 12
+                max_delay = 180
                 strategy = "Timeout Recovery"
+                print("   ⏱️  Timeout Error: Google servers may be busy or network is slow")
             else:
                 # Other network errors
-                base_delay = 3
-                max_delay = 45
+                base_delay = 5
+                max_delay = 60
                 strategy = "Network Recovery"
+                print("   🌐 Network Error: General connectivity issue")
 
             # Exponential backoff with jitter
-            wait_time = min(base_delay * (2 ** attempt) + (attempt * 2), max_delay)
+            wait_time = min(base_delay * (2 ** attempt) + (attempt * 3), max_delay)
 
             print(f"🌐 {strategy} - {operation} of {filename}")
             print(f"   Error: {error}")
-            print(f"   Attempt: {attempt + 1}")
+            print(f"   Attempt: {attempt + 1}/5")
             print(f"⏳ Waiting {wait_time}s before retry...")
 
-            # Add connection diagnostics for SSL errors
-            if 'SSL:' in error_str:
-                print("   💡 SSL Tip: Try switching to wired connection or checking VPN settings")
+            # Add specific troubleshooting tips
+            if 'ssl:' in error_str or 'cipher' in error_str:
+                print("   💡 SSL Tips:")
+                print("      • Try switching from WiFi to wired connection")
+                print("      • Disable VPN/proxy if active")
+                print("      • Check firewall settings")
+                print("      • Try a different network")
+            elif 'timeout' in error_str:
+                print("   💡 Timeout Tips:")
+                print("      • Check internet speed and stability")
+                print("      • Try during off-peak hours")
+                print("      • Large files may take longer")
 
             time.sleep(wait_time)
             return True  # Should retry
@@ -662,6 +682,154 @@ class GoogleDriveTransfer:
             print(f"   • Average speed: {avg_speed:.2f} MB/s")
         print("=" * 80)
 
+def run_network_diagnostics():
+    """Run comprehensive network diagnostic tests for Google Drive connectivity."""
+    print("=" * 70)
+    print("🌐 GOOGLE DRIVE NETWORK DIAGNOSTICS")
+    print("=" * 70)
+
+    tests_passed = 0
+    tests_total = 0
+
+    # Test 1: Basic internet connectivity
+    tests_total += 1
+    print(f"\n📡 Test {tests_total}: Basic Internet Connectivity")
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://www.google.com", timeout=10)
+        print("   ✅ PASS: Internet connection is working")
+        tests_passed += 1
+    except Exception as e:
+        print(f"   ❌ FAIL: No internet connection - {e}")
+
+    # Test 2: DNS resolution
+    tests_total += 1
+    print(f"\n🌐 Test {tests_total}: DNS Resolution")
+    try:
+        import socket
+        ip = socket.gethostbyname('www.googleapis.com')
+        print(f"   ✅ PASS: DNS resolution working (Google APIs: {ip})")
+        tests_passed += 1
+    except Exception as e:
+        print(f"   ❌ FAIL: DNS resolution failed - {e}")
+
+    # Test 3: Google APIs connectivity
+    tests_total += 1
+    print(f"\n🔗 Test {tests_total}: Google APIs Connectivity")
+    try:
+        import urllib.request
+        req = urllib.request.Request('https://www.googleapis.com/drive/v3/about?fields=kind')
+        req.add_header('User-Agent', 'GoogleDriveTransfer-Diagnostic/1.0')
+        with urllib.request.urlopen(req, timeout=15) as response:
+            if response.status == 200:
+                print("   ✅ PASS: Google Drive API is accessible")
+                tests_passed += 1
+            else:
+                print(f"   ❌ FAIL: Unexpected response status: {response.status}")
+    except Exception as e:
+        print(f"   ❌ FAIL: Cannot connect to Google APIs - {e}")
+
+    # Test 4: SSL/TLS handshake test
+    tests_total += 1
+    print(f"\n🔒 Test {tests_total}: SSL/TLS Handshake")
+    try:
+        import ssl
+        import socket
+        context = ssl.create_default_context()
+        with socket.create_connection(('www.googleapis.com', 443), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname='www.googleapis.com') as ssock:
+                cert = ssock.getpeercert()
+                # Handle different certificate formats
+                subject = cert.get('subject', [])
+                if subject and len(subject) > 4 and len(subject[4]) > 0:
+                    cert_name = subject[4][0][1]
+                else:
+                    cert_name = "Google Services"
+                print(f"   ✅ PASS: SSL handshake successful (cert issued to: {cert_name})")
+                tests_passed += 1
+    except ssl.SSLError as e:
+        print(f"   ❌ FAIL: SSL handshake failed - {e}")
+        print("   💡 This is likely the cause of your transfer errors!")
+    except Exception as e:
+        print(f"   ❌ FAIL: SSL test failed - {e}")
+
+    # Test 5: Network stability test
+    tests_total += 1
+    print(f"\n📊 Test {tests_total}: Network Stability (ping test)")
+    try:
+        import subprocess
+        result = subprocess.run(['ping', '-c', '3', '-W', '2', 'www.googleapis.com'],
+                              capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            # Extract ping time from output
+            lines = result.stdout.split('\n')
+            for line in lines:
+                if 'round-trip' in line or 'avg' in line:
+                    print(f"   ✅ PASS: Network stable - {line.strip()}")
+                    tests_passed += 1
+                    break
+            else:
+                print("   ✅ PASS: Network ping successful")
+                tests_passed += 1
+        else:
+            print(f"   ❌ FAIL: Ping failed - {result.stderr}")
+    except Exception as e:
+        print(f"   ⚠️  SKIP: Ping test not available - {e}")
+
+    # Test 6: VPN/Proxy detection
+    tests_total += 1
+    print(f"\n🔍 Test {tests_total}: VPN/Proxy Detection")
+    try:
+        import urllib.request
+        req = urllib.request.Request('https://httpbin.org/ip')
+        req.add_header('User-Agent', 'GoogleDriveTransfer-Diagnostic/1.0')
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            print(f"   ℹ️  Your public IP: {data['origin']}")
+
+        # Check for common proxy headers
+        proxy_indicators = []
+        if 'HTTP_X_FORWARDED_FOR' in os.environ:
+            proxy_indicators.append('HTTP_X_FORWARDED_FOR')
+        if 'http_proxy' in os.environ or 'https_proxy' in os.environ:
+            proxy_indicators.append('proxy environment variables')
+
+        if proxy_indicators:
+            print(f"   ⚠️  WARNING: Proxy/VPN detected - {', '.join(proxy_indicators)}")
+            print("   💡 Proxy/VPN can interfere with SSL connections")
+        else:
+            print("   ✅ PASS: No proxy/VPN detected")
+            tests_passed += 1
+    except Exception as e:
+        print(f"   ❌ FAIL: IP detection failed - {e}")
+
+    # Results summary
+    print(f"\n" + "=" * 70)
+    print(f"📋 DIAGNOSTIC RESULTS: {tests_passed}/{tests_total} tests passed")
+    print("=" * 70)
+
+    if tests_passed >= tests_total - 1:  # Allow 1 failure
+        print("🎉 Network looks good for Google Drive transfers!")
+    else:
+        print("⚠️  Network issues detected that may cause transfer problems")
+
+    # Provide specific recommendations
+    print("\n💡 RECOMMENDATIONS:")
+    print("   1. Use a wired connection instead of WiFi for large transfers")
+    print("   2. Disable VPN/proxy if experiencing SSL errors")
+    print("   3. Try during off-peak hours to reduce network congestion")
+    print("   4. Ensure firewall allows HTTPS connections to *.googleapis.com")
+    print("   5. If using corporate network, check with IT about SSL restrictions")
+    print("   6. For persistent SSL errors, try: python drive_transfer.py --disable-ssl-verify")
+
+    if tests_passed < tests_total:
+        print("\n🔧 TROUBLESHOOTING SSL ERRORS:")
+        print("   • Switch from WiFi to wired Ethernet connection")
+        print("   • Temporarily disable VPN software")
+        print("   • Check firewall/proxy settings")
+        print("   • Try from a different network/location")
+        print("   • Contact ISP if errors persist")
+
 def load_config() -> TransferConfig:
     """Load configuration from file or create default."""
     if os.path.exists(CONFIG_FILE):
@@ -681,34 +849,55 @@ def save_config(config: TransferConfig):
 
 def main():
     parser = argparse.ArgumentParser(description='Google Drive Transfer Tool')
-    parser.add_argument('--source', required=True, help='Source folder ID')
-    parser.add_argument('--dest', required=True, help='Destination folder ID')
-    parser.add_argument('--workers', type=int, default=8, help='Number of parallel workers')
-    parser.add_argument('--timeout', type=int, default=300, help='Network timeout in seconds (default: 300)')
-    parser.add_argument('--chunk-size', type=int, default=8*1024*1024, help='Chunk size in bytes (default: 8MB)')
-    parser.add_argument('--disable-resumable', action='store_true', help='Disable resumable uploads')
-    parser.add_argument('--disable-ssl-verify', action='store_true', help='Disable SSL certificate verification (use with caution)')
-    parser.add_argument('--config', action='store_true', help='Setup configuration')
+    # Create subparsers for different commands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+    # Transfer command (requires source and dest)
+    transfer_parser = subparsers.add_parser('transfer', help='Transfer files between folders')
+    transfer_parser.add_argument('--source', required=True, help='Source folder ID')
+    transfer_parser.add_argument('--dest', required=True, help='Destination folder ID')
+    transfer_parser.add_argument('--workers', type=int, default=8, help='Number of parallel workers')
+    transfer_parser.add_argument('--timeout', type=int, default=300, help='Network timeout in seconds (default: 300)')
+    transfer_parser.add_argument('--chunk-size', type=int, default=8*1024*1024, help='Chunk size in bytes (default: 8MB)')
+    transfer_parser.add_argument('--disable-resumable', action='store_true', help='Disable resumable uploads')
+    transfer_parser.add_argument('--disable-ssl-verify', action='store_true', help='Disable SSL certificate verification (use with caution)')
+
+    # Network test command (standalone)
+    network_parser = subparsers.add_parser('network-test', help='Run network diagnostic tests')
+
+    # Config command (standalone)
+    config_parser = subparsers.add_parser('config', help='Setup configuration')
 
     args = parser.parse_args()
 
-    # Load or create configuration
-    config = load_config()
-    config.source_folder_id = args.source
-    config.dest_folder_id = args.dest
-    config.max_workers = args.workers
-    config.network_timeout = args.timeout
-    config.chunk_size = args.chunk_size
-    config.enable_resumable = not args.disable_resumable
-    config.disable_ssl_verify = args.disable_ssl_verify
+    # Handle different commands
+    if args.command == 'network-test':
+        print("🔍 Running network diagnostics...")
+        run_network_diagnostics()
+        return
 
-    if args.config:
+    elif args.command == 'config':
+        config = load_config()
         save_config(config)
         print("✅ Configuration saved!")
         return
 
-    # Create transfer instance
-    transfer = GoogleDriveTransfer(config)
+    elif args.command == 'transfer':
+        # Load or create configuration
+        config = load_config()
+        config.source_folder_id = args.source
+        config.dest_folder_id = args.dest
+        config.max_workers = args.workers
+        config.network_timeout = args.timeout
+        config.chunk_size = args.chunk_size
+        config.enable_resumable = not args.disable_resumable
+        config.disable_ssl_verify = args.disable_ssl_verify
+
+        # Create transfer instance
+        transfer = GoogleDriveTransfer(config)
+    else:
+        parser.print_help()
+        return
 
     try:
         # Authenticate
