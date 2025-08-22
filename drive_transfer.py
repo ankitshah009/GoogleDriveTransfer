@@ -725,9 +725,17 @@ def run_network_diagnostics():
                 print("   ✅ PASS: Google Drive API is accessible")
                 tests_passed += 1
             else:
-                print(f"   ❌ FAIL: Unexpected response status: {response.status}")
+                print(f"   ⚠️  WARNING: Unexpected response status: {response.status}")
     except Exception as e:
-        print(f"   ❌ FAIL: Cannot connect to Google APIs - {e}")
+        if hasattr(e, 'code') and e.code == 401:
+            print("   ✅ PASS: Google APIs are reachable (authentication required)")
+            tests_passed += 1
+        elif hasattr(e, 'code') and e.code in [403, 429]:
+            print(f"   ⚠️  WARNING: Google APIs returned {e.code} - may indicate quota/rate limits")
+        elif hasattr(e, 'code'):
+            print(f"   ❌ FAIL: Google APIs error {e.code}: {e}")
+        else:
+            print(f"   ❌ FAIL: Cannot connect to Google APIs - {e}")
 
     # Test 4: SSL/TLS handshake test
     tests_total += 1
