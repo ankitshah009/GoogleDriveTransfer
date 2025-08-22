@@ -23,4 +23,20 @@ if [ ! -f "drive_transfer.py" ]; then
 fi
 
 # Run the transfer tool with transfer subcommand
+echo "🚀 Starting Google Drive Transfer..."
 python3 drive_transfer.py transfer "$@"
+
+# Check the exit code
+exit_code=$?
+if [ $exit_code -eq 0 ]; then
+    echo "✅ Transfer completed successfully!"
+else
+    echo "❌ Transfer failed with exit code: $exit_code"
+    echo "💡 Check the error messages above for details"
+    echo "🔧 Troubleshooting tips:"
+    echo "   • Ensure credentials.json is present and valid"
+    echo "   • Check your internet connection stability"
+    echo "   • Try with --disable-ssl-verify if SSL errors persist"
+    echo "   • Run with fewer workers: --workers 2"
+    exit $exit_code
+fi

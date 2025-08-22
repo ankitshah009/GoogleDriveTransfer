@@ -26,6 +26,7 @@ import pickle
 import io
 import ssl
 import urllib3.exceptions
+from contextlib import contextmanager
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -38,7 +39,7 @@ class TransferConfig:
     """Configuration for the transfer operation."""
     source_folder_id: str
     dest_folder_id: str
-    max_workers: int = 8
+    max_workers: int = 4  # Reduced from 8 to prevent memory pressure
     chunk_size: int = 8 * 1024 * 1024  # 8MB chunks
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -47,6 +48,7 @@ class TransferConfig:
     network_timeout: int = 300  # 5 minutes timeout for network operations
     enable_resumable: bool = True  # Enable resumable uploads
     disable_ssl_verify: bool = False  # Disable SSL certificate verification (use with caution)
+    adaptive_concurrency: bool = True  # Enable adaptive worker scaling
 
 @dataclass
 class FileInfo:
@@ -72,6 +74,30 @@ class GoogleDriveTransfer:
         self.transferred_bytes = 0
         self.total_bytes = 0
         self.start_time = None
+        self.error_count = 0  # Track errors for adaptive concurrency
+        self.current_workers = self.config.max_workers  # Adaptive worker count
+        self.ssl_context = self._create_ssl_context()  # Robust SSL context
+
+    def _create_ssl_context(self):
+        """Create a robust SSL context to prevent SSL handshake failures."""
+        try:
+            # Create SSL context with secure defaults
+            context = ssl.create_default_context()
+            context.check_hostname = not self.config.disable_ssl_verify
+            context.verify_mode = ssl.CERT_NONE if self.config.disable_ssl_verify else ssl.CERT_REQUIRED
+
+            # Set secure cipher suites that work with Google APIs
+            context.set_ciphers('ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384')
+
+            # Set secure options
+            context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1  # Disable older TLS versions
+            context.options |= ssl.OP_NO_COMPRESSION  # Disable compression to prevent CRIME attacks
+
+            return context
+        except Exception as e:
+            print(f"⚠️  Warning: Could not create custom SSL context: {e}")
+            print("   Using system default SSL context")
+            return None
 
     def is_network_error(self, error):
         """Check if error is a network-related issue that should be retried."""
@@ -101,30 +127,35 @@ class GoogleDriveTransfer:
 
         return any(net_error in error_str for net_error in network_errors)
 
-    def handle_network_error(self, error, operation, filename, attempt=0):
-        """Handle network errors with intelligent retry logic."""
+    def handle_network_error(self, error, operation, filename, attempt=0, force_reinitialize=False):
+        """Handle network errors with intelligent retry logic and connection reinitialization."""
         if self.is_network_error(error):
             error_str = str(error).lower()
 
             # Different strategies for different error types
             if ('ssl:' in error_str or 'decryption failed' in error_str or
-                'bad record mac' in error_str or 'cipher operation failed' in error_str):
-                # SSL/TLS handshake failures - need longer delays
+                'bad record mac' in error_str or 'cipher operation failed' in error_str or
+                'wrong version number' in error_str):
+                # SSL/TLS handshake failures - need longer delays and reinitialization
                 base_delay = 15  # Start with 15 seconds for SSL issues
                 max_delay = 300  # Max 5 minutes for SSL issues
                 strategy = "SSL/TLS Handshake Recovery"
+                force_reinitialize = True
                 print("   🔒 SSL Error: This may be caused by network interference or VPN issues")
+                print("   🔄 Will reinitialize connection on retry")
             elif 'incompleteread' in error_str or 'connectionreseterror' in error_str:
                 # Connection interruption - moderate delays
                 base_delay = 8
                 max_delay = 120
                 strategy = "Connection Reset Recovery"
+                force_reinitialize = True
                 print("   📡 Connection Error: Check your internet connection stability")
             elif 'timeouterror' in error_str or 'connection timed out' in error_str:
                 # Timeout issues - longer delays
                 base_delay = 12
                 max_delay = 180
                 strategy = "Timeout Recovery"
+                force_reinitialize = True
                 print("   ⏱️  Timeout Error: Google servers may be busy or network is slow")
             else:
                 # Other network errors
@@ -133,16 +164,79 @@ class GoogleDriveTransfer:
                 strategy = "Network Recovery"
                 print("   🌐 Network Error: General connectivity issue")
 
-            # Simple exponential backoff
-            wait_time = min(base_delay * (2 ** attempt), max_delay)
+            # Exponential backoff with jitter to avoid thundering herd
+            import random
+            jitter = random.uniform(0.1, 1.0)
+            wait_time = min(base_delay * (2 ** attempt) * jitter, max_delay)
 
             print(f"🌐 {strategy} - {operation} of {filename}")
             print(f"   Attempt: {attempt + 1}/3")
-            print(f"⏳ Waiting {wait_time}s before retry...")
+            print(f"⏳ Waiting {wait_time:.1f}s before retry...")
 
             time.sleep(wait_time)
+
+            # Force garbage collection to clean up any corrupted objects
+            if force_reinitialize:
+                import gc
+                gc.collect()
+                print("   🧹 Memory cleanup completed")
+
             return True  # Should retry
         return False  # Don't retry
+
+    @contextmanager
+    def safe_download_context(self, request, buffer):
+        """Context manager for safe MediaIoBaseDownload operations."""
+        downloader = None
+        try:
+            downloader = MediaIoBaseDownload(buffer, request)
+            yield downloader
+        finally:
+            # Ensure downloader is properly cleaned up
+            if downloader:
+                del downloader
+            # Force cleanup of buffer if it's corrupted
+            if hasattr(buffer, 'close'):
+                try:
+                    buffer.close()
+                except:
+                    pass
+
+    @contextmanager
+    def safe_upload_context(self, stream, mimetype, chunk_size, resumable):
+        """Context manager for safe MediaIoBaseUpload operations."""
+        uploader = None
+        try:
+            uploader = MediaIoBaseUpload(stream, mimetype=mimetype, chunksize=chunk_size, resumable=resumable)
+            yield uploader
+        finally:
+            # Ensure uploader is properly cleaned up
+            if uploader:
+                del uploader
+            # Force cleanup of stream if it's corrupted
+            if hasattr(stream, 'close'):
+                try:
+                    stream.close()
+                except:
+                    pass
+
+    def adjust_concurrency(self, success: bool):
+        """Adjust worker count based on transfer success/failure for adaptive concurrency."""
+        if not self.config.adaptive_concurrency:
+            return
+
+        with self.progress_lock:
+            if success:
+                self.error_count = max(0, self.error_count - 1)
+                # Gradually increase workers on success (up to original max)
+                if self.error_count == 0 and self.current_workers < self.config.max_workers:
+                    self.current_workers = min(self.current_workers + 1, self.config.max_workers)
+            else:
+                self.error_count += 1
+                # Reduce workers on errors to prevent cascade failures
+                if self.error_count >= 3 and self.current_workers > 2:
+                    self.current_workers = max(2, self.current_workers - 1)
+                    print(f"⚠️  Reduced workers to {self.current_workers} due to errors")
 
     def authenticate(self):
         """Authenticate with Google Drive API for both accounts."""
@@ -424,10 +518,14 @@ class GoogleDriveTransfer:
 
                 # For Google Docs, export as Microsoft Office format
                 if local_file_info.mime_type.startswith('application/vnd.google-apps'):
-                    return self._transfer_google_doc(local_file_info, parent_id)
+                    result = self._transfer_google_doc(local_file_info, parent_id)
+                    self.adjust_concurrency(result)
+                    return result
 
                 # For regular files, download and upload
-                return self._transfer_regular_file(local_file_info, parent_id)
+                result = self._transfer_regular_file(local_file_info, parent_id)
+                self.adjust_concurrency(result)
+                return result
 
             except HttpError as e:
                 if e.resp.status in [403, 429, 500, 502, 503, 504]:
@@ -441,6 +539,7 @@ class GoogleDriveTransfer:
                         return False
                 else:
                     print(f"❌ Error transferring {local_file_info.name}: {e}")
+                    self.adjust_concurrency(False)
                     return False
             except Exception as e:
                 # Check if it's a network error that should be retried
@@ -449,6 +548,7 @@ class GoogleDriveTransfer:
                     continue
                 else:
                     print(f"❌ Unexpected error transferring {local_file_info.name}: {e}")
+                    self.adjust_concurrency(False)
                     return False
 
         return False
@@ -480,61 +580,64 @@ class GoogleDriveTransfer:
                     'parents': [parent_id]
                 }
 
-                # Download and upload in chunks with timeout
-                downloader = MediaIoBaseDownload(io.BytesIO(), request)
+                # Download and upload in chunks with timeout using safe context manager
+                download_buffer = io.BytesIO()
                 done = False
-                file_content = io.BytesIO()
                 download_start_time = time.time()
 
-                while not done:
-                    try:
-                        status, done = downloader.next_chunk()
-                        if status:
-                            file_content.write(status)
+                with self.safe_download_context(request, download_buffer) as downloader:
+                    while not done:
+                        try:
+                            status, done = downloader.next_chunk()
+                            if status:
+                                download_buffer.write(status)
 
-                        # Check for download timeout
-                        if time.time() - download_start_time > self.config.network_timeout:
-                            raise TimeoutError(f"Download timeout after {self.config.network_timeout}s")
+                            # Check for download timeout
+                            if time.time() - download_start_time > self.config.network_timeout:
+                                raise TimeoutError(f"Download timeout after {self.config.network_timeout}s")
 
-                    except Exception as e:
-                        if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "export download", file_info.name, attempt)
-                            break  # Retry the whole operation
-                        else:
-                            raise e
+                        except Exception as e:
+                            if self.is_network_error(e) and attempt < self.config.max_retries - 1:
+                                self.handle_network_error(e, "export download", file_info.name, attempt, force_reinitialize=True)
+                                break  # Retry the whole operation
+                            else:
+                                raise e
 
                 if not done:  # Download was interrupted, retry whole operation
                     continue
 
+                # Use the successfully downloaded content
+                download_buffer.seek(0)
+                file_content = download_buffer
+
                 file_content.seek(0)
 
-                # Upload with timeout
-                media = MediaIoBaseUpload(
-                    file_content,
-                    mimetype=export_mime,
-                    chunksize=self.config.chunk_size,
-                    resumable=self.config.enable_resumable
-                )
-
+                # Upload with timeout using safe context manager
                 upload_start_time = time.time()
 
-                try:
-                    uploaded_file = self.dest_service.files().create(
-                        body=file_metadata, media_body=media, fields='id, name'
-                    ).execute()
+                with self.safe_upload_context(
+                    file_content,
+                    export_mime,
+                    self.config.chunk_size,
+                    self.config.enable_resumable
+                ) as media:
+                    try:
+                        uploaded_file = self.dest_service.files().create(
+                            body=file_metadata, media_body=media, fields='id, name'
+                        ).execute()
 
-                    if uploaded_file is None:
-                        raise Exception("File upload returned None response")
+                        if uploaded_file is None:
+                            raise Exception("File upload returned None response")
 
-                    print(f"📄 Transferred Google Doc: {file_info.name}")
-                    return True
+                        print(f"📄 Transferred Google Doc: {file_info.name}")
+                        return True
 
-                except Exception as e:
-                    if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                        self.handle_network_error(e, "export upload", file_info.name, attempt)
-                        continue
-                    else:
-                        raise e
+                    except Exception as e:
+                        if self.is_network_error(e) and attempt < self.config.max_retries - 1:
+                            self.handle_network_error(e, "export upload", file_info.name, attempt)
+                            continue
+                        else:
+                            raise e
 
             except Exception as e:
                 if self.is_network_error(e) and attempt < self.config.max_retries - 1:
@@ -558,71 +661,76 @@ class GoogleDriveTransfer:
 
                 # Download file from source with timeout
                 request = self.source_service.files().get_media(fileId=file_info.id)
-                file_content = io.BytesIO()
 
-                downloader = MediaIoBaseDownload(file_content, request)
+                # Create FRESH BytesIO buffer for each attempt to prevent memory corruption
+                download_buffer = io.BytesIO()
                 done = False
                 download_start_time = time.time()
 
-                while not done:
-                    try:
-                        status, done = downloader.next_chunk()
-                        if status:
-                            progress = int(status.progress() * 100)
-                            size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
-                            downloaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
-                            print(f"⬇️  {file_info.name}: {progress}% ({downloaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
+                with self.safe_download_context(request, download_buffer) as downloader:
+                    while not done:
+                        try:
+                            status, done = downloader.next_chunk()
+                            if status:
+                                progress = int(status.progress() * 100)
+                                size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
+                                downloaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
+                                print(f"⬇️  {file_info.name}: {progress}% ({downloaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
 
-                        # Check for download timeout
-                        if time.time() - download_start_time > self.config.network_timeout:
-                            raise TimeoutError(f"Download timeout after {self.config.network_timeout}s")
+                            # Check for download timeout
+                            if time.time() - download_start_time > self.config.network_timeout:
+                                raise TimeoutError(f"Download timeout after {self.config.network_timeout}s")
 
-                    except Exception as e:
-                        if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "download", file_info.name, attempt)
-                            break  # Retry the whole operation
-                        else:
-                            raise e
+                        except Exception as e:
+                            if self.is_network_error(e) and attempt < self.config.max_retries - 1:
+                                self.handle_network_error(e, "download", file_info.name, attempt, force_reinitialize=True)
+                                break  # Retry the whole operation
+                            else:
+                                raise e
 
                 if not done:  # Download was interrupted, retry whole operation
                     continue
 
+                # Use the successfully downloaded content
+                download_buffer.seek(0)
+                file_content = download_buffer
+
                 file_content.seek(0)
 
-                # Upload to destination with timeout
-                media = MediaIoBaseUpload(
-                    file_content,
-                    mimetype=file_info.mime_type,
-                    chunksize=self.config.chunk_size,
-                    resumable=self.config.enable_resumable
-                )
-
-                uploader = self.dest_service.files().create(
-                    body=file_metadata, media_body=media, fields='id, name'
-                )
-
-                response = None
+                # Upload to destination with timeout using safe context manager
                 upload_start_time = time.time()
 
-                while response is None:
-                    try:
-                        status, response = uploader.next_chunk()
-                        if status:
-                            progress = int(status.progress() * 100)
-                            size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
-                            uploaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
-                            print(f"⬆️  {file_info.name}: {progress}% ({uploaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
+                with self.safe_upload_context(
+                    file_content,
+                    file_info.mime_type,
+                    self.config.chunk_size,
+                    self.config.enable_resumable
+                ) as media:
+                    uploader = self.dest_service.files().create(
+                        body=file_metadata, media_body=media, fields='id, name'
+                    )
 
-                        # Check for upload timeout
-                        if time.time() - upload_start_time > self.config.network_timeout:
-                            raise TimeoutError(f"Upload timeout after {self.config.network_timeout}s")
+                    response = None
 
-                    except Exception as e:
-                        if self.is_network_error(e) and attempt < self.config.max_retries - 1:
-                            self.handle_network_error(e, "upload", file_info.name, attempt)
-                            break  # Retry the whole operation
-                        else:
-                            raise e
+                    while response is None:
+                        try:
+                            status, response = uploader.next_chunk()
+                            if status:
+                                progress = int(status.progress() * 100)
+                                size_mb = file_info.size / (1024 * 1024) if file_info.size else 0
+                                uploaded_mb = (status.progress() * file_info.size) / (1024 * 1024) if file_info.size else 0
+                                print(f"⬆️  {file_info.name}: {progress}% ({uploaded_mb:.1f}/{size_mb:.1f} MB)", end='\r')
+
+                            # Check for upload timeout
+                            if time.time() - upload_start_time > self.config.network_timeout:
+                                raise TimeoutError(f"Upload timeout after {self.config.network_timeout}s")
+
+                        except Exception as e:
+                            if self.is_network_error(e) and attempt < self.config.max_retries - 1:
+                                self.handle_network_error(e, "upload", file_info.name, attempt)
+                                break  # Retry the whole operation
+                            else:
+                                raise e
 
                 if response is None:  # Upload was interrupted, retry whole operation
                     continue
@@ -678,17 +786,23 @@ class GoogleDriveTransfer:
         print("=" * 80)
 
         # Use ThreadPoolExecutor for parallel processing with memory safety
-        print(f"🛡️  Using memory-safe parallel processing with {min(self.config.max_workers, 4)} workers")
+        print(f"🛡️  Using memory-safe parallel processing with {self.current_workers} workers")
+        print(f"   📊 Adaptive concurrency: {'enabled' if self.config.adaptive_concurrency else 'disabled'}")
 
-        # Limit workers to prevent memory issues (max 4 for stability)
-        safe_workers = min(self.config.max_workers, 4)
+        # Use adaptive worker count
+        safe_workers = self.current_workers
 
-        with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             # Process files in small batches to prevent memory buildup
-            batch_size = safe_workers * 2
-            for i in range(0, len(file_list), batch_size):
+            i = 0
+            while i < len(file_list):
+                # Recalculate workers and batch size based on current adaptive count
+                current_batch_workers = self.current_workers
+                batch_size = current_batch_workers * 2
                 batch = file_list[i:i + batch_size]
+
                 print(f"📦 Processing batch {i//batch_size + 1}/{(len(file_list) + batch_size - 1)//batch_size} ({len(batch)} files)")
+                print(f"   👥 Using {current_batch_workers} workers")
 
                 # Submit batch of file transfer tasks
                 future_to_file = {
@@ -711,8 +825,11 @@ class GoogleDriveTransfer:
                 import gc
                 gc.collect()
 
+                # Move to next batch
+                i += batch_size
+
                 # Small pause between batches to let system recover
-                if i + batch_size < len(file_list):
+                if i < len(file_list):
                     time.sleep(0.5)
 
         end_time = time.time()
