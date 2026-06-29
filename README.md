@@ -12,6 +12,8 @@ A high-performance tool to transfer files and folders between Google Drive accou
 - **📄 Google Docs Support**: Converts Google Docs to Microsoft Office formats
 - **🔄 Resume Capability**: Handles interruptions gracefully with retry mechanisms
 - **🎛️ Configurable**: Adjustable settings for workers, chunk sizes, and retry policies
+- **🔗 Shortcut Support**: Automatically transfers Google Drive shortcuts (recreates them in destination); use `--skip-shortcuts` to disable
+- **🚀 Shared Drives Support**: Full support for Shared Drives / Team Drives via `supportsAllDrives` and `includeItemsFromAllDrives`
 
 ## 🛠️ Prerequisites
 
@@ -19,6 +21,7 @@ A high-performance tool to transfer files and folders between Google Drive accou
 - Google Cloud Console project with Drive API enabled
 - OAuth 2.0 credentials (JSON file)
 - Two Google Drive accounts (source and destination)
+- **Enhanced for latest Google Drive API v3 (shared drives, shortcuts)** — uses `google-api-python-client >=2.198` (Jun 2026) and updated `google-auth` libraries
 
 ## 📋 Setup Instructions
 
@@ -134,6 +137,9 @@ python drive_transfer.py --source SOURCE_FOLDER_ID --dest DEST_FOLDER_ID --worke
 
 # Save configuration for repeated use
 python drive_transfer.py --source SOURCE_FOLDER_ID --dest DEST_FOLDER_ID --config
+
+# Example: High-performance transfer skipping shortcuts (shortcuts enabled by default)
+python drive_transfer.py transfer --source ID --dest ID --workers 12 --skip-shortcuts
 ```
 
 ### Configuration File
@@ -172,6 +178,9 @@ Edit `transfer_config.json`:
 | `progress_interval` | Progress update frequency | 10 | 5-20 |
 | `network_timeout` | Network operation timeout (seconds) | 300 | 300-600 for slow connections |
 | `enable_resumable` | Enable resumable uploads | true | Keep enabled for reliability |
+| `transfer_shortcuts` | Transfer Google Drive shortcuts (recreate in destination) | true | Keep enabled; use `--skip-shortcuts` to disable |
+
+**Note:** Shared Drives / Team Drives are supported automatically via `supportsAllDrives=True` and `includeItemsFromAllDrives=True` (Google Drive API v3). No extra configuration required.
 
 ## 📊 Performance Optimization
 
@@ -207,6 +216,11 @@ python drive_transfer.py --source ID --dest ID --workers 16
 - **Google Sheets** → Microsoft Excel (.xlsx)
 - **Google Slides** → Microsoft PowerPoint (.pptx)
 - **Other Google files** → Skipped with warning
+
+### Google Drive Shortcuts
+- **Shortcuts** (`application/vnd.google-apps.shortcut`) → Automatically recreated in destination using the same target ID
+- Shortcuts are transferred by default; disable with `--skip-shortcuts`
+- Requires latest Google Drive API v3 client (`google-api-python-client >=2.198`)
 
 ## 📈 Monitoring and Progress
 
@@ -363,6 +377,16 @@ logging.basicConfig(level=logging.DEBUG)
 4. **"Memory error"**
    - Reduce max_workers
    - Increase system RAM
+
+5. **Shortcuts not transferring (or "Skipping shortcut")**
+   - Shortcuts are transferred by default (requires `google-api-python-client >=2.198`)
+   - If disabled, re-run without `--skip-shortcuts`
+   - Verify the shortcut target still exists and is accessible from the source account
+
+6. **Shared Drive / Team Drive items missing**
+   - Ensure the authenticated account has access to the Shared Drive
+   - The tool uses `supportsAllDrives=True` and `includeItemsFromAllDrives=True` automatically
+   - Folder IDs from Shared Drives work the same as regular Drive folders
 
 ## 📝 Example Use Cases
 

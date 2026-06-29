@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Helper script to get Google Drive folder IDs
-This script helps users easily find the folder IDs they need for the transfer
+This script helps users easily find the folder IDs they need for the transfer.
+Now surfaces shortcuts too when present (via shortcutDetails in results).
 """
 
 import os
@@ -45,50 +46,54 @@ def get_service():
         with open(TOKEN_FILE, 'wb') as token:
             pickle.dump(creds, token)
 
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 def list_folders(service, parent_id='root', indent=0):
-    """Recursively list folders and their IDs."""
+    """Recursively list folders (and shortcuts to folders when present) and their IDs."""
     try:
-        # Get folders in current directory
+        # Get folders (shortcuts surfaced via shortcutDetails when present) in current directory
         query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         results = service.files().list(
             q=query,
-            fields="files(id, name, parents)",
-            orderBy="name"
+            fields="files(id, name, parents, shortcutDetails)",
+            orderBy="name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
 
         folders = results.get('files', [])
 
         for folder in folders:
-            # Print folder with indentation
+            # Print folder (or shortcut to folder) with indentation
             prefix = "  " * indent
             print(f"{prefix}📁 {folder['name']}")
             print(f"{prefix}   ID: {folder['id']}")
             print(f"{prefix}   URL: https://drive.google.com/drive/folders/{folder['id']}")
             print()
 
-            # Recursively list subfolders (with depth limit to avoid infinite recursion)
+            # Recursively list subfolders/shortcuts (with depth limit to avoid infinite recursion)
             if indent < 5:  # Limit depth to prevent too much output
                 list_folders(service, folder['id'], indent + 1)
 
     except HttpError as e:
-        print(f"❌ Error accessing folder: {e}")
+        print(f"❌ Error accessing folder (or shortcut): {e}")
 
 def search_folders(service, search_term):
-    """Search for folders by name."""
+    """Search for folders (and shortcuts when present) by name."""
     try:
         query = f"name contains '{search_term}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         results = service.files().list(
             q=query,
-            fields="files(id, name, parents)",
-            orderBy="name"
+            fields="files(id, name, parents, shortcutDetails)",
+            orderBy="name",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
 
         folders = results.get('files', [])
 
         if folders:
-            print(f"\n🔍 Found {len(folders)} folder(s) matching '{search_term}':")
+            print(f"\n🔍 Found {len(folders)} folder(s)/shortcut(s) matching '{search_term}':")
             print("=" * 50)
             for folder in folders:
                 print(f"📁 {folder['name']}")
@@ -96,10 +101,10 @@ def search_folders(service, search_term):
                 print(f"   URL: https://drive.google.com/drive/folders/{folder['id']}")
                 print()
         else:
-            print(f"❌ No folders found matching '{search_term}'")
+            print(f"❌ No folders/shortcuts found matching '{search_term}'")
 
     except HttpError as e:
-        print(f"❌ Error searching folders: {e}")
+        print(f"❌ Error searching folders/shortcuts: {e}")
 
 def main():
     """Main function."""
@@ -112,8 +117,8 @@ def main():
         return
 
     print("\n📋 Choose an option:")
-    print("1. List all folders (starting from root)")
-    print("2. Search for folders by name")
+    print("1. List all folders (starting from root) — surfaces shortcuts too when present")
+    print("2. Search for folders by name — surfaces shortcuts too when present")
     print("3. Exit")
 
     while True:
@@ -121,13 +126,13 @@ def main():
             choice = input("\nEnter your choice (1-3): ").strip()
 
             if choice == '1':
-                print("\n📂 Listing all folders...")
+                print("\n📂 Listing all folders (shortcuts surfaced via shortcutDetails when present)...")
                 print("Note: This may take a while for large drives")
                 list_folders(service)
                 break
 
             elif choice == '2':
-                search_term = input("Enter folder name to search: ").strip()
+                search_term = input("Enter folder name to search (shortcuts surfaced too when present): ").strip()
                 if search_term:
                     search_folders(service, search_term)
                 else:

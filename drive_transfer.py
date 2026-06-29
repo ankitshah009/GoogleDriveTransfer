@@ -3,6 +3,12 @@
 Google Drive Transfer Tool
 Transfers files and folders between Google Drive accounts while preserving structure.
 Optimized for maximum speed with parallel processing and rate limiting handling.
+
+Enhancements (Jun 2026):
+- Requires google-api-python-client >=2.198 and updated google-auth
+- Full Shared Drives / Team Drives support via supportsAllDrives + includeItemsFromAllDrives
+- Google Drive shortcuts (application/vnd.google-apps.shortcut) are transferred by default (recreated in destination)
+- Use --skip-shortcuts to disable shortcut transfer
 """
 
 import os
@@ -51,6 +57,7 @@ class TransferConfig:
     adaptive_concurrency: bool = True  # Enable adaptive worker scaling
     max_files: Optional[int] = None  # Limit number of files for debugging
     debug_mode: bool = False  # Enable debug output
+    transfer_shortcuts: bool = True  # Enable transfer of Google Drive shortcuts
 
 @dataclass
 class FileInfo:
@@ -61,6 +68,8 @@ class FileInfo:
     size: int
     parents: List[str]
     path: str = ""
+    shortcut_target_id: Optional[str] = None
+    is_shortcut: bool = False
 
 class GoogleDriveTransfer:
     """Main class for handling Google Drive transfers."""
@@ -266,9 +275,9 @@ class GoogleDriveTransfer:
             with open(token_file, 'wb') as token:
                 pickle.dump(creds, token)
 
-        # Build service with basic configuration (always executed)
+        # Build service with modern config for reliability (latest client best practice)
         try:
-            return build('drive', 'v3', credentials=creds)
+            return build('drive', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
             print(f"❌ Error creating service for {account_type}: {e}")
             raise
@@ -312,13 +321,17 @@ class GoogleDriveTransfer:
 
             for item in folder_items:
                 file_path = f"{current_path}/{item['name']}" if current_path else item['name']
+                shortcut_details = item.get('shortcutDetails', {}) or {}
+                is_shortcut = item.get('mimeType') == 'application/vnd.google-apps.shortcut'
                 file_info = FileInfo(
                     id=item['id'],
                     name=item['name'],
                     mime_type=item.get('mimeType', ''),
                     size=int(item.get('size', 0)),
                     parents=item.get('parents', []),
-                    path=file_path
+                    path=file_path,
+                    shortcut_target_id=shortcut_details.get('targetId') if is_shortcut else None,
+                    is_shortcut=is_shortcut
                 )
                 structure[item['id']] = file_info
 
@@ -344,9 +357,11 @@ class GoogleDriveTransfer:
 
                 results = service.files().list(
                     q=f"'{folder_id}' in parents and trashed = false",
-                    fields="nextPageToken, files(id, name, mimeType, size, parents)",
+                    fields="nextPageToken, files(id, name, mimeType, size, parents, shortcutDetails, driveId)",
                     pageToken=page_token,
-                    pageSize=1000
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True
                 ).execute()
 
                 if results is None:
@@ -419,7 +434,7 @@ class GoogleDriveTransfer:
 
             try:
                 created_folder = self.dest_service.files().create(
-                    body=folder_metadata, fields='id'
+                    body=folder_metadata, fields='id', supportsAllDrives=True
                 ).execute()
 
                 if created_folder is None:
@@ -440,7 +455,9 @@ class GoogleDriveTransfer:
             results = self.dest_service.files().list(
                 q=f"name = '{folder_name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
                 fields="files(id, name)",
-                pageSize=1000  # Increased from 1 to prevent pagination issues
+                pageSize=1000,  # Increased from 1 to prevent pagination issues
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
             ).execute()
 
             if results is None:
@@ -468,7 +485,9 @@ class GoogleDriveTransfer:
             mime_type=file_info.mime_type,
             size=file_info.size,
             parents=file_info.parents[:],  # Copy to avoid reference issues
-            path=file_info.path
+            path=file_info.path,
+            shortcut_target_id=file_info.shortcut_target_id,
+            is_shortcut=file_info.is_shortcut
         )
 
         for attempt in range(self.config.max_retries):
@@ -487,6 +506,12 @@ class GoogleDriveTransfer:
                     )
                     if parent_folder and parent_folder.id in self.folder_mapping:
                         parent_id = self.folder_mapping[parent_folder.id]
+
+                # For shortcuts, create a shortcut in destination (no media transfer)
+                if local_file_info.mime_type == 'application/vnd.google-apps.shortcut':
+                    result = self._transfer_shortcut(local_file_info, parent_id)
+                    self.adjust_concurrency(result)
+                    return result
 
                 # For Google Docs, export as Microsoft Office format
                 if local_file_info.mime_type.startswith('application/vnd.google-apps'):
@@ -543,7 +568,7 @@ class GoogleDriveTransfer:
 
                 # Export the file
                 request = self.source_service.files().export_media(
-                    fileId=file_info.id, mimeType=export_mime
+                    fileId=file_info.id, mimeType=export_mime, supportsAllDrives=True
                 )
 
                 # Create file metadata for destination
@@ -601,7 +626,7 @@ class GoogleDriveTransfer:
 
                 try:
                     uploaded_file = self.dest_service.files().create(
-                        body=file_metadata, media_body=media, fields='id, name'
+                        body=file_metadata, media_body=media, fields='id, name', supportsAllDrives=True
                     ).execute()
 
                     if uploaded_file is None:
@@ -640,7 +665,7 @@ class GoogleDriveTransfer:
                 }
 
                 # Download file from source with timeout
-                request = self.source_service.files().get_media(fileId=file_info.id)
+                request = self.source_service.files().get_media(fileId=file_info.id, supportsAllDrives=True)
 
                 # Create FRESH BytesIO buffer for each attempt to prevent closed file errors
                 download_buffer = io.BytesIO()
@@ -693,7 +718,7 @@ class GoogleDriveTransfer:
                 )
 
                 uploader = self.dest_service.files().create(
-                    body=file_metadata, media_body=media, fields='id, name'
+                    body=file_metadata, media_body=media, fields='id, name', supportsAllDrives=True
                 )
 
                 response = None
@@ -737,6 +762,62 @@ class GoogleDriveTransfer:
                     continue
                 else:
                     print(f"❌ Error transferring file {file_info.name}: {e}")
+                    return False
+
+        return False
+
+    def _transfer_shortcut(self, file_info: FileInfo, parent_id: str) -> bool:
+        """Transfer a Google Drive shortcut by creating it in the destination."""
+        if not self.config.transfer_shortcuts:
+            print(f"⏭️  Skipping shortcut (disabled): {file_info.name}")
+            return True
+
+        if not file_info.shortcut_target_id:
+            print(f"⚠️  Skipping shortcut with missing target: {file_info.name}")
+            return False
+
+        for attempt in range(self.config.max_retries):
+            try:
+                shortcut_metadata = {
+                    'name': file_info.name,
+                    'mimeType': 'application/vnd.google-apps.shortcut',
+                    'shortcutDetails': {
+                        'targetId': file_info.shortcut_target_id
+                    },
+                    'parents': [parent_id]
+                }
+
+                created_shortcut = self.dest_service.files().create(
+                    body=shortcut_metadata,
+                    supportsAllDrives=True,
+                    fields='id'
+                ).execute()
+
+                if created_shortcut is None:
+                    raise Exception("Shortcut creation returned None response")
+
+                print(f"🔗 Transferred shortcut: {file_info.name}")
+                return True
+
+            except HttpError as e:
+                if e.resp.status in [403, 429, 500, 502, 503, 504]:
+                    if attempt < self.config.max_retries - 1:
+                        wait_time = self.config.retry_delay * (2 ** attempt)
+                        print(f"⚠️  Rate limit hit, retrying in {wait_time}s... ({file_info.name})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ Failed to transfer shortcut {file_info.name}: {e}")
+                        return False
+                else:
+                    print(f"❌ Error transferring shortcut {file_info.name}: {e}")
+                    return False
+            except Exception as e:
+                if self.is_network_error(e) and attempt < self.config.max_retries - 1:
+                    self.handle_network_error(e, "shortcut transfer", file_info.name, attempt)
+                    continue
+                else:
+                    print(f"❌ Unexpected error transferring shortcut {file_info.name}: {e}")
                     return False
 
         return False
@@ -1063,7 +1144,15 @@ def load_config() -> TransferConfig:
     """Load configuration from file or create default."""
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
-            data = json.load(f)
+            raw = f.read()
+        # Strip comments for human-readable config files (// and /* */)
+        # Supports documented examples with comments (e.g., transfer_config.json)
+        import re
+        # Remove /* */ block comments
+        raw = re.sub(r'/\*.*?\*/', '', raw, flags=re.DOTALL)
+        # Remove // line comments (but keep http:// etc by only stripping after whitespace or start)
+        raw = re.sub(r'(^|\s)//.*$', '', raw, flags=re.MULTILINE)
+        data = json.loads(raw)
         return TransferConfig(**data)
     else:
         return TransferConfig(
@@ -1093,6 +1182,7 @@ def main():
     transfer_parser.add_argument('--disable-ssl-verify', action='store_true', help='Disable SSL certificate verification (use with caution)')
     transfer_parser.add_argument('--max-files', type=int, help='Limit number of files to transfer (for debugging)')
     transfer_parser.add_argument('--debug', action='store_true', help='Enable detailed debugging output')
+    transfer_parser.add_argument('--skip-shortcuts', action='store_true', help='Skip transferring Google Drive shortcuts (enabled by default for latest Drive API)')
 
     # Network test command (standalone)
     network_parser = subparsers.add_parser('network-test', help='Run network diagnostic tests')
@@ -1135,6 +1225,7 @@ def main():
         config.disable_ssl_verify = args.disable_ssl_verify
         config.max_files = getattr(args, 'max_files', None)
         config.debug_mode = getattr(args, 'debug', False)
+        config.transfer_shortcuts = not getattr(args, 'skip_shortcuts', False)
 
         # Create transfer instance
         transfer = GoogleDriveTransfer(config)
@@ -1166,10 +1257,13 @@ def main():
         # Detailed breakdown of what was found
         total_files = len([f for f in source_files.values() if f.mime_type != 'application/vnd.google-apps.folder'])
         total_folders = len([f for f in source_files.values() if f.mime_type == 'application/vnd.google-apps.folder'])
+        total_shortcuts = len([f for f in source_files.values() if f.mime_type == 'application/vnd.google-apps.shortcut'])
 
         print(f"✅ Found {len(source_files)} total items:")
         print(f"   📁 {total_folders} folders")
         print(f"   📄 {total_files} files")
+        if total_shortcuts > 0:
+            print(f"   🔗 {total_shortcuts} shortcuts")
 
         if total_files == 0:
             print("⚠️  No files found! This could be due to:")
